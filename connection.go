@@ -1829,12 +1829,7 @@ func (s *connection) maybeSendAckOnlyPacket() error {
 		if packet == nil {
 			return nil
 		}
-		s.logCoalescedPacket(packet)
-		for _, p := range packet.packets {
-			s.sentPacketHandler.SentPacket(p.ToAckHandlerPacket(time.Now(), s.retransmissionQueue))
-		}
-		s.connIDManager.SentPacket()
-		s.sendQueue.Send(packet.buffer)
+		s.sendPackedCoalescedPacket(packet, time.Now())
 		return nil
 	}
 
@@ -1852,7 +1847,7 @@ func (s *connection) maybeSendAckOnlyPacket() error {
 func (s *connection) sendProbePacket(encLevel protocol.EncryptionLevel) error {
 	// Queue probe packets until we actually send out a packet,
 	// or until there are no more packets to queue.
-	var packet *packedPacket
+	var packet *coalescedPacket
 	for {
 		if wasQueued := s.sentPacketHandler.QueueProbePacket(encLevel); !wasQueued {
 			break
@@ -1884,10 +1879,10 @@ func (s *connection) sendProbePacket(encLevel protocol.EncryptionLevel) error {
 			return err
 		}
 	}
-	if packet == nil || packet.packetContents == nil {
+	if packet == nil || len(packet.packets) == 0 {
 		return fmt.Errorf("connection BUG: couldn't pack %s probe packet", encLevel)
 	}
-	s.sendPackedPacket(packet, time.Now())
+	s.sendPackedCoalescedPacket(packet, time.Now())
 	return nil
 }
 
@@ -1904,15 +1899,7 @@ func (s *connection) sendPacket() (bool, error) {
 			return false, err
 		}
 		s.sentFirstPacket = true
-		s.logCoalescedPacket(packet)
-		for _, p := range packet.packets {
-			if s.firstAckElicitingPacketAfterIdleSentTime.IsZero() && p.IsAckEliciting() {
-				s.firstAckElicitingPacketAfterIdleSentTime = now
-			}
-			s.sentPacketHandler.SentPacket(p.ToAckHandlerPacket(now, s.retransmissionQueue))
-		}
-		s.connIDManager.SentPacket()
-		s.sendQueue.Send(packet.buffer)
+		s.sendPackedCoalescedPacket(packet, now)
 		return true, nil
 	}
 	if !s.config.DisablePathMTUDiscovery && s.mtuDiscoverer.ShouldSendProbe(now) {
@@ -1937,6 +1924,18 @@ func (s *connection) sendPackedPacket(packet *packedPacket, now time.Time) {
 	}
 	s.logPacket(packet)
 	s.sentPacketHandler.SentPacket(packet.ToAckHandlerPacket(now, s.retransmissionQueue))
+	s.connIDManager.SentPacket()
+	s.sendQueue.Send(packet.buffer)
+}
+
+func (s *connection) sendPackedCoalescedPacket(packet *coalescedPacket, now time.Time) {
+	s.logCoalescedPacket(packet)
+	for _, p := range packet.packets {
+		if s.firstAckElicitingPacketAfterIdleSentTime.IsZero() && p.IsAckEliciting() {
+			s.firstAckElicitingPacketAfterIdleSentTime = now
+		}
+		s.sentPacketHandler.SentPacket(p.ToAckHandlerPacket(now, s.retransmissionQueue))
+	}
 	s.connIDManager.SentPacket()
 	s.sendQueue.Send(packet.buffer)
 }
