@@ -674,6 +674,87 @@ var _ = Describe("Receive Stream", func() {
 				Expect(err).ToNot(HaveOccurred())
 			})
 		})
+
+		Context("receiving RELIABLE_RESET_STREAM frames", func() {
+			var rst *wire.ResetStreamFrame
+
+			BeforeEach(func() {
+				rst = &wire.ResetStreamFrame{
+					StreamID:  streamID,
+					FinalSize: 42,
+					ErrorCode: 1234,
+				}
+			})
+
+			It("doesn't read the error, until it can read the reliable size", func() {
+				done := make(chan struct{})
+				go func() {
+					defer GinkgoRecover()
+					b := make([]byte, 3)
+					n, err := strWithTimeout.Read(b)
+					done <- struct{}{}
+					Expect(n).To(Equal(3))
+					Expect(b).To(Equal([]byte("foo")))
+					n, err = strWithTimeout.Read(b)
+					Expect(n).To(Equal(3))
+					Expect(b).To(Equal([]byte("bar")))
+					Expect(err).To(MatchError(&StreamError{
+						StreamID:  streamID,
+						ErrorCode: 1234,
+					}))
+					close(done)
+				}()
+				Consistently(done).ShouldNot(Receive())
+				rst.ReliableSize = 6
+				gomock.InOrder(
+					mockFC.EXPECT().UpdateHighestReceived(protocol.ByteCount(42), true),
+					mockFC.EXPECT().UpdateHighestReceived(protocol.ByteCount(6), false),
+					mockFC.EXPECT().Abandon(),
+				)
+				Expect(str.handleResetStreamFrame(rst)).To(Succeed())
+				Consistently(done).ShouldNot(BeClosed())
+
+				str.handleStreamFrame(&wire.StreamFrame{
+					StreamID: streamID,
+					Data:     []byte("foobar"),
+				})
+				mockSender.EXPECT().onStreamCompleted(streamID)
+				Eventually(done).Should(Receive())
+				Eventually(done).Should(BeClosed())
+			})
+
+			It("immediately reads the error, if we read past the reliable size", func() {
+				mockFC.EXPECT().UpdateHighestReceived(protocol.ByteCount(6), false)
+				str.handleStreamFrame(&wire.StreamFrame{
+					StreamID: streamID,
+					Data:     []byte("foobar"),
+				})
+				mockFC.EXPECT().AddBytesRead(protocol.ByteCount(3))
+				n, err := strWithTimeout.Read(make([]byte, 3))
+				Expect(n).To(Equal(3))
+				Expect(err).ToNot(HaveOccurred())
+
+				mockFC.EXPECT().UpdateHighestReceived(protocol.ByteCount(42), true)
+				mockFC.EXPECT().Abandon()
+				mockSender.EXPECT().onStreamCompleted(streamID)
+				rst.ReliableSize = 3
+				Expect(str.handleResetStreamFrame(rst)).To(Succeed())
+				n, err = strWithTimeout.Read(make([]byte, 3))
+				Expect(n).To(BeZero())
+				Expect(err).To(MatchError(&StreamError{
+					StreamID:  streamID,
+					ErrorCode: 1234,
+				}))
+			})
+
+			It("errors when receiving a RESET_STREAM with an inconsistent reliable sizes", func() {
+				mockFC.EXPECT().UpdateHighestReceived(protocol.ByteCount(42), true).Times(2)
+				rst.ReliableSize = 3
+				Expect(str.handleResetStreamFrame(rst)).To(Succeed())
+				rst.ReliableSize = 5
+				Expect(str.handleResetStreamFrame(rst)).To(MatchError("inconsistent reliable size received: 5 (was 3)"))
+			})
+		})
 	})
 
 	Context("flow control", func() {

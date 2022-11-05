@@ -41,6 +41,9 @@ type receiveStream struct {
 	cancelReadErr       error
 	resetRemotelyErr    *StreamError
 
+	readPos      protocol.ByteCount
+	reliableSize protocol.ByteCount
+
 	closedForShutdown bool // set when CloseForShutdown() is called
 	finRead           bool // set once we read a frame with a Fin
 	canceledRead      bool // set when CancelRead() is called
@@ -94,6 +97,9 @@ func (s *receiveStream) Read(p []byte) (int, error) {
 	s.mutex.Unlock()
 
 	if completed {
+		if s.resetRemotely {
+			s.flowController.Abandon()
+		}
 		s.sender.onStreamCompleted(s.streamID)
 	}
 	return n, err
@@ -106,7 +112,7 @@ func (s *receiveStream) readImpl(p []byte) (bool /*stream completed */, int, err
 	if s.canceledRead {
 		return false, 0, s.cancelReadErr
 	}
-	if s.resetRemotely {
+	if s.resetRemotely && s.readPos >= s.reliableSize {
 		return false, 0, s.resetRemotelyErr
 	}
 	if s.closedForShutdown {
@@ -131,7 +137,8 @@ func (s *receiveStream) readImpl(p []byte) (bool /*stream completed */, int, err
 			if s.canceledRead {
 				return false, bytesRead, s.cancelReadErr
 			}
-			if s.resetRemotely {
+			if s.resetRemotely && s.readPos >= s.reliableSize {
+				// TODO: reliable offset?
 				return false, bytesRead, s.resetRemotelyErr
 			}
 
@@ -176,6 +183,7 @@ func (s *receiveStream) readImpl(p []byte) (bool /*stream completed */, int, err
 
 		m := copy(p[bytesRead:], s.currentFrame[s.readPosInFrame:])
 		s.readPosInFrame += m
+		s.readPos += protocol.ByteCount(m)
 		bytesRead += m
 
 		// when a RESET_STREAM was received, the was already informed about the final byteOffset for this stream
@@ -187,6 +195,9 @@ func (s *receiveStream) readImpl(p []byte) (bool /*stream completed */, int, err
 			s.finRead = true
 			return true, bytesRead, io.EOF
 		}
+	}
+	if s.resetRemotely && s.readPos >= s.reliableSize {
+		return true, bytesRead, s.resetRemotelyErr
 	}
 	return false, bytesRead, nil
 }
@@ -284,15 +295,19 @@ func (s *receiveStream) handleResetStreamFrameImpl(frame *wire.ResetStreamFrame)
 
 	// ignore duplicate RESET_STREAM frames for this stream (after checking their final offset)
 	if s.resetRemotely {
+		if s.reliableSize != frame.ReliableSize {
+			return false, fmt.Errorf("inconsistent reliable size received: %d (was %d)", frame.ReliableSize, s.reliableSize)
+		}
 		return false, nil
 	}
+	s.reliableSize = frame.ReliableSize
 	s.resetRemotely = true
 	s.resetRemotelyErr = &StreamError{
 		StreamID:  s.streamID,
 		ErrorCode: frame.ErrorCode,
 	}
 	s.signalRead()
-	return newlyRcvdFinalOffset, nil
+	return newlyRcvdFinalOffset && s.readPos >= s.reliableSize, nil
 }
 
 func (s *receiveStream) CloseRemote(offset protocol.ByteCount) {
