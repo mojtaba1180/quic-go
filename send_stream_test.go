@@ -894,12 +894,12 @@ var _ = Describe("Send Stream", func() {
 
 	Context("retransmissions", func() {
 		It("queues and retrieves frames", func() {
-			str.numOutstandingFrames = 1
 			f := &wire.StreamFrame{
 				Data:           []byte("foobar"),
 				Offset:         0x42,
 				DataLenPresent: false,
 			}
+			str.outstandingFrames[f] = struct{}{}
 			mockSender.EXPECT().onHasStreamData(streamID)
 			str.queueRetransmission(f)
 			frame, _ := str.popStreamFrame(protocol.MaxByteCount)
@@ -911,12 +911,12 @@ var _ = Describe("Send Stream", func() {
 		})
 
 		It("splits a retransmission", func() {
-			str.numOutstandingFrames = 1
 			sf := &wire.StreamFrame{
 				Data:           []byte("foobar"),
 				Offset:         0x42,
 				DataLenPresent: false,
 			}
+			str.outstandingFrames[sf] = struct{}{}
 			mockSender.EXPECT().onHasStreamData(streamID)
 			str.queueRetransmission(sf)
 			frame, hasMoreData := str.popStreamFrame(sf.Length(str.version) - 3)
@@ -935,12 +935,12 @@ var _ = Describe("Send Stream", func() {
 		})
 
 		It("returns nil if the size is too small", func() {
-			str.numOutstandingFrames = 1
 			f := &wire.StreamFrame{
 				Data:           []byte("foobar"),
 				Offset:         0x42,
 				DataLenPresent: false,
 			}
+			str.outstandingFrames[f] = struct{}{}
 			mockSender.EXPECT().onHasStreamData(streamID)
 			str.queueRetransmission(f)
 			frame, hasMoreData := str.popStreamFrame(2)
@@ -1154,6 +1154,128 @@ var _ = Describe("Send Stream", func() {
 				}
 			}
 			Expect(received).To(Equal(data))
+		})
+	})
+
+	Context("reliable resets", func() {
+		BeforeEach(func() {
+			mockSender.EXPECT().onHasStreamData(streamID).AnyTimes()
+			mockFC.EXPECT().SendWindowSize().Return(protocol.MaxByteCount).AnyTimes()
+			mockFC.EXPECT().AddBytesSent(gomock.Any()).AnyTimes()
+		})
+
+		It("waits until the stream frame has been dequeued", func() {
+			_, err := str.Write([]byte("foobar"))
+			Expect(err).ToNot(HaveOccurred())
+			str.SetResetBarrier()
+
+			frame1, hasMore := str.popStreamFrame(7)
+			Expect(hasMore).To(BeTrue())
+			Expect(frame1).ToNot(BeNil())
+			f := frame1.Frame.(*wire.StreamFrame)
+			Expect(f.Data).To(Equal([]byte("foo")))
+
+			mockSender.EXPECT().queueControlFrame(&wire.ResetStreamFrame{
+				StreamID:     streamID,
+				FinalSize:    6,
+				ReliableSize: 6,
+				ErrorCode:    42,
+			})
+			str.CancelWrite(42)
+
+			frame2, hasMore := str.popStreamFrame(protocol.MaxByteCount)
+			Expect(hasMore).To(BeFalse())
+			Expect(frame2).ToNot(BeNil())
+			f = frame2.Frame.(*wire.StreamFrame)
+			Expect(f.Data).To(Equal([]byte("bar")))
+
+			frame1.OnAcked(frame1.Frame)
+			mockSender.EXPECT().onStreamCompleted(streamID)
+			frame2.OnAcked(frame2.Frame)
+		})
+
+		It("resets immediately when it has already sent stream data up to the offset", func() {
+			_, err := str.Write([]byte("foobar"))
+			Expect(err).ToNot(HaveOccurred())
+
+			frame, hasMore := str.popStreamFrame(protocol.MaxByteCount)
+			Expect(hasMore).To(BeFalse())
+			Expect(frame).ToNot(BeNil())
+			f := frame.Frame.(*wire.StreamFrame)
+			Expect(f.Data).To(Equal([]byte("foobar")))
+			frame.OnAcked(frame.Frame)
+
+			str.SetResetBarrier()
+			gomock.InOrder(
+				mockSender.EXPECT().queueControlFrame(&wire.ResetStreamFrame{
+					StreamID:     streamID,
+					FinalSize:    6,
+					ReliableSize: 6,
+					ErrorCode:    42,
+				}),
+				mockSender.EXPECT().onStreamCompleted(streamID),
+			)
+			str.CancelWrite(42)
+		})
+
+		It("doesn't care about frames after the barrier", func() {
+			_, err := str.Write([]byte("foobar"))
+			Expect(err).ToNot(HaveOccurred())
+			frame1, hasMore := str.popStreamFrame(protocol.MaxByteCount)
+			Expect(hasMore).To(BeFalse())
+			Expect(frame1).ToNot(BeNil())
+
+			str.SetResetBarrier()
+
+			_, err = str.Write([]byte("foobar"))
+			Expect(err).ToNot(HaveOccurred())
+			frame2, hasMore := str.popStreamFrame(protocol.MaxByteCount)
+			Expect(hasMore).To(BeFalse())
+			Expect(frame2).ToNot(BeNil())
+
+			mockSender.EXPECT().queueControlFrame(&wire.ResetStreamFrame{
+				StreamID:     streamID,
+				FinalSize:    12,
+				ReliableSize: 6,
+				ErrorCode:    99,
+			})
+			str.CancelWrite(99)
+
+			mockSender.EXPECT().onStreamCompleted(streamID)
+			frame1.OnAcked(frame1.Frame)
+		})
+
+		It("retransmits frames up to the barrier", func() {
+			_, err := str.Write([]byte("foobar"))
+			Expect(err).ToNot(HaveOccurred())
+			str.SetResetBarrier()
+			_, err = str.Write(make([]byte, 100))
+			Expect(err).ToNot(HaveOccurred())
+
+			frame1, hasMore := str.popStreamFrame(protocol.MaxByteCount)
+			Expect(hasMore).To(BeFalse())
+			Expect(frame1).ToNot(BeNil())
+
+			frame1.OnLost(frame1.Frame)
+
+			mockSender.EXPECT().queueControlFrame(&wire.ResetStreamFrame{
+				StreamID:     streamID,
+				FinalSize:    106,
+				ReliableSize: 6,
+				ErrorCode:    99,
+			})
+			str.CancelWrite(99)
+
+			frame2, hasMore := str.popStreamFrame(protocol.MaxByteCount)
+			Expect(hasMore).To(BeFalse())
+			Expect(frame2).ToNot(BeNil())
+			f := frame2.Frame.(*wire.StreamFrame)
+			Expect(f.Offset).To(BeZero())
+			Expect(f.Fin).To(BeFalse())
+			Expect(f.Data).To(Equal([]byte("foobar")))
+
+			mockSender.EXPECT().onStreamCompleted(streamID)
+			frame2.OnAcked(frame2.Frame)
 		})
 	})
 })
